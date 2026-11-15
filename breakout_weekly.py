@@ -1,4 +1,5 @@
-# Weekly Breakout - ALL NSE + ALL BSE - PDF ONLY with TradingView Links - No 260 Days Filter
+# Weekly Breakout - ALL NSE + ALL BSE - PDF ONLY with TradingView Links - TRUE ATH FIX v2
+# FIX: auto_adjust=False (real price like TradingView) + period=max (full history)
 import yfinance as yf, pandas as pd, numpy as np, urllib.request, io, os, requests, json, time, zipfile
 from datetime import datetime, timedelta
 from fpdf import FPDF
@@ -46,11 +47,9 @@ def fetch_bse_bhavcopy():
             print(f"Bhavcopy downloaded: {len(zip_bytes)} bytes for {date_str}")
             with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
                 names = z.namelist()
-                print(f"Files in zip: {names}")
                 csv_name = names[0]
                 csv_data = z.read(csv_name).decode('utf-8', errors='ignore')
                 df = pd.read_csv(io.StringIO(csv_data))
-                print(f"Bhavcopy columns: {list(df.columns)[:10]}")
                 code_col = None
                 for c in df.columns:
                     if c.strip().upper() in ["SC_CODE", "SCCODE", "SCRIP_CODE", "CODE"]:
@@ -92,7 +91,8 @@ def process_exchange(symbols, suffix, exchange_name):
         chunk_tickers = tickers[ci:ci+CHUNK]
         print(f"{exchange_name} Chunk {ci//CHUNK+1}/{(len(tickers)+CHUNK-1)//CHUNK} - {len(chunk_tickers)}")
         try:
-            data = yf.download(chunk_tickers, period="3y", interval="1d", progress=False, auto_adjust=True, threads=False, group_by='ticker')
+            # FIXED: period=max + auto_adjust=False = Real TradingView Price
+            data = yf.download(chunk_tickers, period="max", interval="1d", progress=False, auto_adjust=False, threads=False, group_by='ticker')
         except Exception as e:
             print(f"Chunk failed: {e}"); time.sleep(5); continue
         time.sleep(2)
@@ -103,24 +103,31 @@ def process_exchange(symbols, suffix, exchange_name):
                 if dfd is None or len(dfd) < 5: continue
                 dfd = dfd.dropna()
                 if len(dfd) < 5: continue
+                # Use Close column (unadjusted Close, not Adj Close)
                 dfw = pd.DataFrame()
                 dfw['Close'] = dfd['Close'].resample('W-FRI').last()
                 dfw['High'] = dfd['High'].resample('W-FRI').max()
                 dfw['Volume'] = dfd['Volume'].resample('W-FRI').sum()
                 if len(dfw) < 3: continue
-                if len(dfw) >= 21:
-                    vol_sma21 = float(dfw['Volume'].rolling(21).mean().iloc[-1])
+                today_weekday = datetime.now().weekday()
+                dfw_closed = dfw.copy()
+                if today_weekday < 4:
+                    dfw_closed = dfw.iloc[:-1]
+                if len(dfw_closed) < 3: continue
+                if len(dfw_closed) >= 21:
+                    vol_sma21 = float(dfw_closed['Volume'].rolling(21).mean().iloc[-1])
                 else:
-                    vol_sma21 = float(dfw['Volume'].mean())
-                last_vol = float(dfw.iloc[-1]['Volume'])
+                    vol_sma21 = float(dfw_closed['Volume'].mean())
+                last_vol = float(dfw_closed.iloc[-1]['Volume'])
                 if vol_sma21 == 0 or pd.isna(vol_sma21): continue
                 vol_ratio = last_vol / vol_sma21
-                last_close = float(dfw.iloc[-1]['Close'])
-                if len(dfw) > 53:
-                    prev_52w_high = float(dfw['High'].iloc[-53:-1].max())
+                last_close = float(dfw_closed.iloc[-1]['Close'])
+                if len(dfw_closed) > 53:
+                    prev_52w_high = float(dfw_closed['High'].iloc[-53:-1].max())
                 else:
-                    prev_52w_high = float(dfw['High'].iloc[:-1].max()) if len(dfw) > 1 else float(dfw['High'].iloc[-1])
-                lifetime_high = float(dfw['High'].iloc[:-1].max()) if len(dfw) > 1 else float(dfw['High'].iloc[-1])
+                    prev_52w_high = float(dfw_closed['High'].iloc[:-1].max()) if len(dfw_closed) > 1 else float(dfw_closed['High'].iloc[-1])
+                # TRUE Lifetime High = Max High of ALL history BEFORE last week, unadjusted
+                lifetime_high = float(dfw_closed['High'].iloc[:-1].max()) if len(dfw_closed) > 1 else float(dfw_closed['High'].iloc[-1])
                 pct_above_52w = (last_close / prev_52w_high - 1) * 100 if prev_52w_high else 0
                 pct_above_lifetime = (last_close / lifetime_high - 1) * 100 if lifetime_high else 0
                 is_breakout = False; is_lifetime = False
@@ -155,7 +162,6 @@ def generate_pdf(today, nse_data, bse_data, nse_total, bse_total):
     def clean(s):
         return s.encode('latin-1', 'replace').decode('latin-1')
     def tv_link(exchange, sym):
-        # TradingView chart link - NSE:SYMBOL or BSE:CODE
         return f"https://www.tradingview.com/chart/?symbol={exchange}:{sym}"
     def add_title(title, subtitle):
         pdf.add_page()
@@ -180,51 +186,52 @@ def generate_pdf(today, nse_data, bse_data, nse_total, bse_total):
         pdf.cell(0, 8, clean(f"{heading} ({len(rows)})"), new_x="LMARGIN", new_y="NEXT")
         pdf.set_fill_color(30, 30, 30)
         pdf.set_text_color(255, 255, 255)
-        pdf.set_font("Helvetica", "B", 9)
-        pdf.cell(12, 7, "#", border=1, fill=True)
-        pdf.cell(55, 7, "Symbol - Click for Chart", border=1, fill=True)
-        pdf.cell(35, 7, "Price", border=1, fill=True)
-        pdf.cell(40, 7, pct_label, border=1, fill=True)
-        pdf.cell(38, 7, "Vol", border=1, fill=True, new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "B", 8)
+        pdf.cell(10, 7, "#", border=1, fill=True)
+        pdf.cell(42, 7, "Symbol", border=1, fill=True)
+        pdf.cell(28, 7, "Price", border=1, fill=True)
+        pdf.cell(32, 7, "Prev High", border=1, fill=True)
+        pdf.cell(32, 7, pct_label, border=1, fill=True)
+        pdf.cell(36, 7, "Vol", border=1, fill=True, new_x="LMARGIN", new_y="NEXT")
         pdf.set_text_color(0, 0, 0)
         for i, (sym, close, high, pct, vr) in enumerate(rows, 1):
             if i % 2 == 0:
                 pdf.set_fill_color(240, 240, 240)
             else:
                 pdf.set_fill_color(255, 255, 255)
-            pdf.set_font("Helvetica", "", 9)
-            pdf.cell(12, 6, str(i), border=1, fill=True)
-            # Symbol with TradingView link - blue + underline
+            pdf.set_font("Helvetica", "", 8)
+            pdf.cell(10, 6, str(i), border=1, fill=True)
             pdf.set_text_color(0, 0, 255)
-            pdf.set_font("Helvetica", "U", 9)
-            pdf.cell(55, 6, clean(str(sym)), border=1, fill=True, link=tv_link(exchange, str(sym)))
+            pdf.set_font("Helvetica", "U", 8)
+            pdf.cell(42, 6, clean(str(sym)), border=1, fill=True, link=tv_link(exchange, str(sym)))
             pdf.set_text_color(0, 0, 0)
-            pdf.set_font("Helvetica", "", 9)
-            pdf.cell(35, 6, f"{close:.2f}", border=1, fill=True)
-            pdf.cell(40, 6, f"+{pct:.1f}%", border=1, fill=True)
-            pdf.cell(38, 6, f"{vr:.1f}x", border=1, fill=True, new_x="LMARGIN", new_y="NEXT")
+            pdf.set_font("Helvetica", "", 8)
+            pdf.cell(28, 6, f"{close:.2f}", border=1, fill=True)
+            pdf.cell(32, 6, f"{high:.2f}", border=1, fill=True)
+            pdf.cell(32, 6, f"+{pct:.1f}%", border=1, fill=True)
+            pdf.cell(36, 6, f"{vr:.1f}x", border=1, fill=True, new_x="LMARGIN", new_y="NEXT")
         pdf.ln(3)
     def add_near_table(heading, rows, exchange):
         if not rows:
             return
         pdf.set_font("Helvetica", "B", 12)
         pdf.cell(0, 8, clean(f"{heading} ({len(rows)})"), new_x="LMARGIN", new_y="NEXT")
-        pdf.set_fill_color(30, 30, 30); pdf.set_text_color(255, 255, 255); pdf.set_font("Helvetica", "B", 9)
-        pdf.cell(12, 7, "#", border=1, fill=True); pdf.cell(55, 7, "Symbol - Click for Chart", border=1, fill=True); pdf.cell(35, 7, "Price", border=1, fill=True); pdf.cell(40, 7, "Below 52W", border=1, fill=True); pdf.cell(38, 7, "Vol", border=1, fill=True, new_x="LMARGIN", new_y="NEXT")
+        pdf.set_fill_color(30, 30, 30); pdf.set_text_color(255, 255, 255); pdf.set_font("Helvetica", "B", 8)
+        pdf.cell(10, 7, "#", border=1, fill=True); pdf.cell(42, 7, "Symbol", border=1, fill=True); pdf.cell(28, 7, "Price", border=1, fill=True); pdf.cell(32, 7, "Prev 52W High", border=1, fill=True); pdf.cell(32, 7, "Below 52W", border=1, fill=True); pdf.cell(36, 7, "Vol", border=1, fill=True, new_x="LMARGIN", new_y="NEXT")
         pdf.set_text_color(0, 0, 0)
         for i, (sym, close, high, pct, vr) in enumerate(rows, 1):
             if i % 2 == 0:
                 pdf.set_fill_color(240, 240, 240)
             else:
                 pdf.set_fill_color(255, 255, 255)
-            pdf.set_font("Helvetica", "", 9)
-            pdf.cell(12, 6, str(i), border=1, fill=True)
+            pdf.set_font("Helvetica", "", 8)
+            pdf.cell(10, 6, str(i), border=1, fill=True)
             pdf.set_text_color(0, 0, 255)
-            pdf.set_font("Helvetica", "U", 9)
-            pdf.cell(55, 6, clean(str(sym)), border=1, fill=True, link=tv_link(exchange, str(sym)))
+            pdf.set_font("Helvetica", "U", 8)
+            pdf.cell(42, 6, clean(str(sym)), border=1, fill=True, link=tv_link(exchange, str(sym)))
             pdf.set_text_color(0, 0, 0)
-            pdf.set_font("Helvetica", "", 9)
-            pdf.cell(35, 6, f"{close:.2f}", border=1, fill=True); pdf.cell(40, 6, f"{pct:.1f}%", border=1, fill=True); pdf.cell(38, 6, f"{vr:.1f}x", border=1, fill=True, new_x="LMARGIN", new_y="NEXT")
+            pdf.set_font("Helvetica", "", 8)
+            pdf.cell(28, 6, f"{close:.2f}", border=1, fill=True); pdf.cell(32, 6, f"{high:.2f}", border=1, fill=True); pdf.cell(32, 6, f"{pct:.1f}%", border=1, fill=True); pdf.cell(36, 6, f"{vr:.1f}x", border=1, fill=True, new_x="LMARGIN", new_y="NEXT")
         pdf.ln(3)
     pdf.add_page()
     pdf.ln(40)
@@ -236,7 +243,7 @@ def generate_pdf(today, nse_data, bse_data, nse_total, bse_total):
     pdf.set_font("Helvetica", "", 11)
     pdf.cell(0, 7, clean(f"NSE Universe: {nse_total} | BSE Universe: {bse_total}"), new_x="LMARGIN", new_y="NEXT", align="C")
     pdf.cell(0, 7, "Filter: Weekly Vol > 2x SMA 21 | No 260 Days Filter", new_x="LMARGIN", new_y="NEXT", align="C")
-    pdf.cell(0, 7, "Even stocks listed 1 month ago included", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.cell(0, 7, "Price = Unadjusted (Like TradingView) | ATH = True ATH Since IPO", new_x="LMARGIN", new_y="NEXT", align="C")
     pdf.set_font("Helvetica", "I", 10)
     pdf.set_text_color(0, 0, 255)
     pdf.cell(0, 7, "Click any Symbol in PDF to open TradingView Chart", new_x="LMARGIN", new_y="NEXT", align="C")
@@ -250,17 +257,17 @@ def generate_pdf(today, nse_data, bse_data, nse_total, bse_total):
     pdf.cell(0, 7, clean(f"NSE - Vol Lifetime: {len(vlt_n)} | Vol 52W: {len(v52_n)} | ALL Lifetime: {len(alt_n)} | ALL 52W: {len(a52_n)} | Near: {len(near_n)}"), new_x="LMARGIN", new_y="NEXT", align="C")
     pdf.cell(0, 7, clean(f"BSE - Vol Lifetime: {len(vlt_b)} | Vol 52W: {len(v52_b)} | ALL Lifetime: {len(alt_b)} | ALL 52W: {len(a52_b)} | Near: {len(near_b)}"), new_x="LMARGIN", new_y="NEXT", align="C")
     add_title("NSE - LIST 1: Vol 2x", f"Weekly Vol > 2x SMA 21 | {today}")
-    add_table("LIFETIME HIGH + Vol 2x", vlt_n, "Above ATH", "NSE")
+    add_table("LIFETIME HIGH + Vol 2x - TRUE ATH", vlt_n, "Above ATH", "NSE")
     add_table("52W HIGH + Vol 2x", v52_n, "Above 52W", "NSE")
     add_title("NSE - LIST 2: ALL Breakouts", f"No Volume Filter | {today}")
-    add_table("ALL LIFETIME HIGH", alt_n, "Above ATH", "NSE")
+    add_table("ALL LIFETIME HIGH - TRUE ATH", alt_n, "Above ATH", "NSE")
     add_table("ALL 52W HIGH", a52_n, "Above 52W", "NSE")
     add_near_table("NEAR HIGH - Watch Next Week", near_n, "NSE")
     add_title("BSE - LIST 1: Vol 2x", f"Weekly Vol > 2x SMA 21 | {today}")
-    add_table("LIFETIME HIGH + Vol 2x", vlt_b, "Above ATH", "BSE")
+    add_table("LIFETIME HIGH + Vol 2x - TRUE ATH", vlt_b, "Above ATH", "BSE")
     add_table("52W HIGH + Vol 2x", v52_b, "Above 52W", "BSE")
     add_title("BSE - LIST 2: ALL Breakouts", f"No Volume Filter | {today}")
-    add_table("ALL LIFETIME HIGH", alt_b, "Above ATH", "BSE")
+    add_table("ALL LIFETIME HIGH - TRUE ATH", alt_b, "Above ATH", "BSE")
     add_table("ALL 52W HIGH", a52_b, "Above 52W", "BSE")
     add_near_table("NEAR HIGH - Watch Next Week", near_b, "BSE")
     pdf_path = f"Weekly_Breakout_{today}.pdf"
@@ -270,7 +277,7 @@ def generate_pdf(today, nse_data, bse_data, nse_total, bse_total):
 
 def main():
     today = datetime.now().strftime('%Y-%m-%d')
-    print(f"=== Weekly Breakout NSE+BSE - PDF ONLY with TradingView Links - {today} ===")
+    print(f"=== Weekly Breakout NSE+BSE - PDF ONLY TRUE ATH v2 - {today} ===")
     nse_syms = fetch_nse()
     nse_syms = list(dict.fromkeys(nse_syms))
     vol_lt_nse, vol_52_nse, all_lt_nse, all_52_nse, near_nse = process_exchange(nse_syms, ".NS", "NSE")
@@ -285,7 +292,7 @@ def main():
         bse_data = ([], [], [], [], [])
     try:
         pdf_path = generate_pdf(today, nse_data, bse_data, len(nse_syms), len(bse_syms))
-        send_telegram_pdf(pdf_path, f"📄 WEEKLY BREAKOUT - NSE + BSE | {today}\nClick Symbol in PDF to open TradingView Chart")
+        send_telegram_pdf(pdf_path, f"📄 WEEKLY BREAKOUT - NSE + BSE | {today}\nTRUE ATH Fixed (Unadjusted Price) - Click Symbol for TradingView")
     except Exception as e:
         print(f"PDF failed: {e}")
 
