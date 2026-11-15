@@ -1,19 +1,26 @@
-# Weekly Breakout - ALL NSE + ALL BSE - 4 Messages - No 260 Days Filter
-import yfinance as yf, pandas as pd, numpy as np, urllib.request, io, os, requests, json
+# Weekly Breakout - ALL NSE + ALL BSE - 4 Messages - FIXED Telegram + BSE
+import yfinance as yf, pandas as pd, numpy as np, urllib.request, io, os, requests, json, time
 from datetime import datetime
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 def send_telegram(msg):
+    # DEBUG - Will show in log if secrets missing
+    print(f"DEBUG Telegram - Token exists: {bool(TELEGRAM_TOKEN)} Len: {len(TELEGRAM_TOKEN)} | Chat ID: '{TELEGRAM_CHAT_ID}'")
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print(msg); return
+        print("ERROR: TELEGRAM_TOKEN or TELEGRAM_CHAT_ID is EMPTY - Add secrets in THIS repo!")
+        print(msg)
+        return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         for i in range(0, len(msg), 4000):
-            requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg[i:i+4000], "parse_mode": "Markdown"}, timeout=15)
+            chunk = msg[i:i+4000]
+            r = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": chunk, "parse_mode": "Markdown"}, timeout=20)
+            print(f"Telegram send status: {r.status_code} | Response: {r.text[:300]}")
+            time.sleep(1)
     except Exception as e:
-        print(f"Telegram failed: {e}")
+        print(f"Telegram failed exception: {e}")
 
 def fetch_nse():
     try:
@@ -33,51 +40,39 @@ def fetch_nse():
         return []
 
 def fetch_bse():
-    # Try BSE API - Active Equity Scrips
+    # BSE needs numeric scrip code, NOT NSE symbol. Try API with proper headers.
     try:
-        req = urllib.request.Request("https://api.bseindia.com/BseIndiaAPI/api/ListofScripData/w?segment=Equity&status=Active", headers={'User-Agent':'Mozilla/5.0', 'Referer':'https://www.bseindia.com/'})
+        headers = {'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Accept':'application/json, text/plain, */*', 'Referer':'https://www.bseindia.com/', 'Origin':'https://www.bseindia.com'}
+        req = urllib.request.Request("https://api.bseindia.com/BseIndiaAPI/api/ListofScripData/w?segment=Equity&status=Active", headers=headers)
         data = urllib.request.urlopen(req, timeout=30).read().decode('utf-8', errors='ignore')
         j = json.loads(data)
-        # BSE API returns list with Scrip_Cd and Scrip_Name / Symbol
-        syms = []
-        # It returns Table array
         rows = j.get("Table", []) if isinstance(j, dict) else j
+        syms = []
         for r in rows:
-            # Scrip code is numeric, yfinance BSE uses Scrip_Cd.BO e.g. 500325.BO
             code = r.get("Scrip_Cd") or r.get("scrip_cd") or r.get("ScripCode")
             if code:
                 syms.append(str(code).strip())
         if len(syms) > 500:
             print(f"Fetched BSE via API: {len(syms)}")
             return syms
-        print(f"BSE API returned only {len(syms)}, trying fallback")
+        print(f"BSE API returned only {len(syms)} - Skipping BSE this run")
+        return []
     except Exception as e:
-        print(f"BSE API failed: {e}")
-    # Fallback: Use NSE symbols with .BO suffix - Most large/mid caps are listed on both
-    # This ensures BSE list still works even if BSE API blocks
-    nse = fetch_nse()
-    print(f"BSE Fallback: Using NSE symbols as BSE symbols: {len(nse)}")
-    return nse
+        print(f"BSE API failed: {e} - Skipping BSE this run, NSE will still send")
+        return []
 
 def process_exchange(symbols, suffix, exchange_name):
-    # suffix: .NS for NSE, .BO for BSE
-    # NO 260 DAYS FILTER - Only need minimum 5 weekly bars
     tickers = [f"{s}{suffix}" for s in symbols]
-    vol_lifetime = []
-    vol_52w = []
-    all_lifetime = []
-    all_52w = []
-    near_high = []
-
-    CHUNK = 500
+    vol_lifetime = []; vol_52w = []; all_lifetime = []; all_52w = []; near_high = []
+    CHUNK = 250  # Reduced from 500 to avoid Yahoo Rate Limit
     for ci in range(0, len(tickers), CHUNK):
         chunk_tickers = tickers[ci:ci+CHUNK]
         print(f"{exchange_name} Chunk {ci//CHUNK+1}/{(len(tickers)+CHUNK-1)//CHUNK} - {len(chunk_tickers)}")
         try:
-            data = yf.download(chunk_tickers, period="3y", interval="1d", progress=False, auto_adjust=True, threads=True, group_by='ticker')
+            data = yf.download(chunk_tickers, period="3y", interval="1d", progress=False, auto_adjust=True, threads=False, group_by='ticker')
         except Exception as e:
-            print(f"Chunk failed: {e}"); continue
-
+            print(f"Chunk failed: {e}"); time.sleep(5); continue
+        time.sleep(2)  # Pause to avoid Rate Limit
         for ticker in chunk_tickers:
             try:
                 sym = ticker.replace(suffix, "")
@@ -85,14 +80,11 @@ def process_exchange(symbols, suffix, exchange_name):
                 if dfd is None or len(dfd) < 5: continue
                 dfd = dfd.dropna()
                 if len(dfd) < 5: continue
-
                 dfw = pd.DataFrame()
                 dfw['Close'] = dfd['Close'].resample('W-FRI').last()
                 dfw['High'] = dfd['High'].resample('W-FRI').max()
                 dfw['Volume'] = dfd['Volume'].resample('W-FRI').sum()
                 if len(dfw) < 3: continue
-
-                # Volume: Weekly Vol vs Weekly SMA 21 - If less than 21 weeks, use average of available weeks
                 if len(dfw) >= 21:
                     vol_sma21 = float(dfw['Volume'].rolling(21).mean().iloc[-1])
                 else:
@@ -100,9 +92,7 @@ def process_exchange(symbols, suffix, exchange_name):
                 last_vol = float(dfw.iloc[-1]['Volume'])
                 if vol_sma21 == 0 or pd.isna(vol_sma21): continue
                 vol_ratio = last_vol / vol_sma21
-
                 last_close = float(dfw.iloc[-1]['Close'])
-                # 52W High = Max of last 52 weeks excluding this week, or all available if less than 52 weeks
                 if len(dfw) > 53:
                     prev_52w_high = float(dfw['High'].iloc[-53:-1].max())
                 else:
@@ -110,14 +100,11 @@ def process_exchange(symbols, suffix, exchange_name):
                 lifetime_high = float(dfw['High'].iloc[:-1].max()) if len(dfw) > 1 else float(dfw['High'].iloc[-1])
                 pct_above_52w = (last_close / prev_52w_high - 1) * 100 if prev_52w_high else 0
                 pct_above_lifetime = (last_close / lifetime_high - 1) * 100 if lifetime_high else 0
-
-                is_breakout = False
-                is_lifetime = False
+                is_breakout = False; is_lifetime = False
                 if last_close > prev_52w_high:
                     is_breakout = True
                     if last_close > lifetime_high:
                         is_lifetime = True
-
                 if is_breakout:
                     if is_lifetime:
                         all_lifetime.append((sym, last_close, lifetime_high, pct_above_lifetime, vol_ratio))
@@ -131,7 +118,6 @@ def process_exchange(symbols, suffix, exchange_name):
                 elif pct_above_52w > -2.0:
                     near_high.append((sym, last_close, prev_52w_high, pct_above_52w, vol_ratio))
             except: continue
-
     vol_lifetime = sorted(vol_lifetime, key=lambda x: x[4], reverse=True)
     vol_52w = sorted(vol_52w, key=lambda x: x[4], reverse=True)
     all_lifetime = sorted(all_lifetime, key=lambda x: x[4], reverse=True)
@@ -190,8 +176,6 @@ def build_msg_list2(exchange, total, all_lifetime, all_52w, near_high, today):
 def main():
     today = datetime.now().strftime('%Y-%m-%d')
     print(f"=== Weekly Breakout NSE+BSE - 4 Messages - {today} ===")
-
-    # NSE
     nse_syms = fetch_nse()
     nse_syms = list(dict.fromkeys(nse_syms))
     vol_lt_nse, vol_52_nse, all_lt_nse, all_52_nse, near_nse = process_exchange(nse_syms, ".NS", "NSE")
@@ -201,17 +185,18 @@ def main():
     print("=== NSE MSG2 ==="); print(msg2_nse)
     send_telegram(msg1_nse)
     send_telegram(msg2_nse)
-
-    # BSE
     bse_syms = fetch_bse()
     bse_syms = list(dict.fromkeys(bse_syms))
-    vol_lt_bse, vol_52_bse, all_lt_bse, all_52_bse, near_bse = process_exchange(bse_syms, ".BO", "BSE")
-    msg1_bse = build_msg_list1("BSE", len(bse_syms), vol_lt_bse, vol_52_bse, today)
-    msg2_bse = build_msg_list2("BSE", len(bse_syms), all_lt_bse, all_52_bse, near_bse, today)
-    print("=== BSE MSG1 ==="); print(msg1_bse)
-    print("=== BSE MSG2 ==="); print(msg2_bse)
-    send_telegram(msg1_bse)
-    send_telegram(msg2_bse)
+    if len(bse_syms) > 500:
+        vol_lt_bse, vol_52_bse, all_lt_bse, all_52_bse, near_bse = process_exchange(bse_syms, ".BO", "BSE")
+        msg1_bse = build_msg_list1("BSE", len(bse_syms), vol_lt_bse, vol_52_bse, today)
+        msg2_bse = build_msg_list2("BSE", len(bse_syms), all_lt_bse, all_52_bse, near_bse, today)
+        print("=== BSE MSG1 ==="); print(msg1_bse)
+        print("=== BSE MSG2 ==="); print(msg2_bse)
+        send_telegram(msg1_bse)
+        send_telegram(msg2_bse)
+    else:
+        print("BSE skipped - API blocked, NSE messages already sent")
 
 if __name__ == "__main__":
     main()
