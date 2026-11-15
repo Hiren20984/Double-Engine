@@ -1,26 +1,21 @@
-# Weekly Breakout - ALL NSE + ALL BSE - 4 Messages - FIXED Telegram + BSE
-import yfinance as yf, pandas as pd, numpy as np, urllib.request, io, os, requests, json, time
-from datetime import datetime
+# Weekly Breakout - ALL NSE + ALL BSE - PDF ONLY - No Text Messages - No 260 Days Filter
+import yfinance as yf, pandas as pd, numpy as np, urllib.request, io, os, requests, json, time, zipfile
+from datetime import datetime, timedelta
+from fpdf import FPDF
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-def send_telegram(msg):
-    # DEBUG - Will show in log if secrets missing
-    print(f"DEBUG Telegram - Token exists: {bool(TELEGRAM_TOKEN)} Len: {len(TELEGRAM_TOKEN)} | Chat ID: '{TELEGRAM_CHAT_ID}'")
+def send_telegram_pdf(pdf_path, caption):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("ERROR: TELEGRAM_TOKEN or TELEGRAM_CHAT_ID is EMPTY - Add secrets in THIS repo!")
-        print(msg)
-        return
+        print("Secrets empty, PDF not sent"); return
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        for i in range(0, len(msg), 4000):
-            chunk = msg[i:i+4000]
-            r = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": chunk, "parse_mode": "Markdown"}, timeout=20)
-            print(f"Telegram send status: {r.status_code} | Response: {r.text[:300]}")
-            time.sleep(1)
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
+        with open(pdf_path, 'rb') as f:
+            r = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption}, files={"document": f}, timeout=60)
+        print(f"Telegram PDF status: {r.status_code} | {r.text[:500]}")
     except Exception as e:
-        print(f"Telegram failed exception: {e}")
+        print(f"Telegram PDF failed: {e}")
 
 def fetch_nse():
     try:
@@ -39,32 +34,60 @@ def fetch_nse():
         print(f"NSE fetch failed: {e}")
         return []
 
-def fetch_bse():
-    # BSE needs numeric scrip code, NOT NSE symbol. Try API with proper headers.
+def fetch_bse_bhavcopy():
+    for days_back in range(1, 8):
+        d = datetime.now() - timedelta(days=days_back)
+        date_str = d.strftime("%d%m%y")
+        url = f"https://www.bseindia.com/download/BhavCopy/Equity/EQ{date_str}_CSV.ZIP"
+        print(f"Trying BSE Bhavcopy: {url}")
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent':'Mozilla/5.0', 'Referer':'https://www.bseindia.com/'})
+            zip_bytes = urllib.request.urlopen(req, timeout=30).read()
+            print(f"Bhavcopy downloaded: {len(zip_bytes)} bytes for {date_str}")
+            with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+                names = z.namelist()
+                print(f"Files in zip: {names}")
+                csv_name = names[0]
+                csv_data = z.read(csv_name).decode('utf-8', errors='ignore')
+                df = pd.read_csv(io.StringIO(csv_data))
+                print(f"Bhavcopy columns: {list(df.columns)[:10]}")
+                code_col = None
+                for c in df.columns:
+                    if c.strip().upper() in ["SC_CODE", "SCCODE", "SCRIP_CODE", "CODE"]:
+                        code_col = c; break
+                if code_col is None:
+                    code_col = df.columns[0]
+                codes = df[code_col].dropna().astype(str).str.strip().tolist()
+                codes = [c for c in codes if c.isdigit() and len(c)==6]
+                codes = list(dict.fromkeys(codes))
+                print(f"Fetched BSE via Bhavcopy ({date_str}): {len(codes)} scrips")
+                if len(codes) > 1000:
+                    return codes
+        except Exception as e:
+            print(f"Bhavcopy {date_str} failed: {e}")
+            continue
+    print("All Bhavcopy attempts failed - Trying BSE API fallback")
     try:
-        headers = {'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Accept':'application/json, text/plain, */*', 'Referer':'https://www.bseindia.com/', 'Origin':'https://www.bseindia.com'}
+        headers = {'User-Agent':'Mozilla/5.0', 'Accept':'application/json', 'Referer':'https://www.bseindia.com/'}
         req = urllib.request.Request("https://api.bseindia.com/BseIndiaAPI/api/ListofScripData/w?segment=Equity&status=Active", headers=headers)
         data = urllib.request.urlopen(req, timeout=30).read().decode('utf-8', errors='ignore')
         j = json.loads(data)
         rows = j.get("Table", []) if isinstance(j, dict) else j
         syms = []
         for r in rows:
-            code = r.get("Scrip_Cd") or r.get("scrip_cd") or r.get("ScripCode")
-            if code:
-                syms.append(str(code).strip())
+            code = r.get("Scrip_Cd") or r.get("scrip_cd")
+            if code: syms.append(str(code).strip())
         if len(syms) > 500:
             print(f"Fetched BSE via API: {len(syms)}")
             return syms
-        print(f"BSE API returned only {len(syms)} - Skipping BSE this run")
-        return []
     except Exception as e:
-        print(f"BSE API failed: {e} - Skipping BSE this run, NSE will still send")
-        return []
+        print(f"BSE API also failed: {e}")
+    return []
 
 def process_exchange(symbols, suffix, exchange_name):
     tickers = [f"{s}{suffix}" for s in symbols]
     vol_lifetime = []; vol_52w = []; all_lifetime = []; all_52w = []; near_high = []
-    CHUNK = 250  # Reduced from 500 to avoid Yahoo Rate Limit
+    CHUNK = 250
     for ci in range(0, len(tickers), CHUNK):
         chunk_tickers = tickers[ci:ci+CHUNK]
         print(f"{exchange_name} Chunk {ci//CHUNK+1}/{(len(tickers)+CHUNK-1)//CHUNK} - {len(chunk_tickers)}")
@@ -72,7 +95,7 @@ def process_exchange(symbols, suffix, exchange_name):
             data = yf.download(chunk_tickers, period="3y", interval="1d", progress=False, auto_adjust=True, threads=False, group_by='ticker')
         except Exception as e:
             print(f"Chunk failed: {e}"); time.sleep(5); continue
-        time.sleep(2)  # Pause to avoid Rate Limit
+        time.sleep(2)
         for ticker in chunk_tickers:
             try:
                 sym = ticker.replace(suffix, "")
@@ -126,77 +149,122 @@ def process_exchange(symbols, suffix, exchange_name):
     print(f"{exchange_name} - Vol Lifetime: {len(vol_lifetime)} | Vol 52W: {len(vol_52w)} | ALL Lifetime: {len(all_lifetime)} | ALL 52W: {len(all_52w)} | Near: {len(near_high)}")
     return vol_lifetime, vol_52w, all_lifetime, all_52w, near_high
 
-def build_msg_list1(exchange, total, vol_lifetime, vol_52w, today):
-    msg = f"🚀 *WEEKLY BREAKOUT - {exchange} - LIST 1: Vol 2x* | {today}\n"
-    msg += f"Universe: {exchange} {total} | Filter: Weekly Vol > 2x SMA 21 | No 260 Days Filter\n\n"
-    if vol_lifetime:
-        msg += f"*🏆 LIFETIME HIGH + Vol 2x ({len(vol_lifetime)}):*\n"
-        for sym, close, high, pct, vr in vol_lifetime[:30]:
-            msg += f"• {sym} @ {close:.2f} | +{pct:.1f}% ATH | Vol {vr:.1f}x\n"
-        if len(vol_lifetime) > 30: msg += f"+ {len(vol_lifetime)-30} more...\n"
-        msg += "\n"
-    else:
-        msg += "*🏆 LIFETIME HIGH + Vol 2x:* None this week\n\n"
-    if vol_52w:
-        msg += f"*📈 52W HIGH + Vol 2x ({len(vol_52w)}):*\n"
-        for sym, close, high, pct, vr in vol_52w[:30]:
-            msg += f"• {sym} @ {close:.2f} | +{pct:.1f}% 52W | Vol {vr:.1f}x\n"
-        if len(vol_52w) > 30: msg += f"+ {len(vol_52w)-30} more...\n"
-        msg += "\n"
-    else:
-        msg += "*📈 52W HIGH + Vol 2x:* None this week\n\n"
-    return msg
-
-def build_msg_list2(exchange, total, all_lifetime, all_52w, near_high, today):
-    msg = f"📋 *WEEKLY BREAKOUT - {exchange} - LIST 2: ALL Breakouts* | {today}\n"
-    msg += f"Universe: {exchange} {total} | No Volume Filter | No 260 Days Filter\n\n"
-    if all_lifetime:
-        msg += f"*🏆 ALL LIFETIME HIGH ({len(all_lifetime)}):*\n"
-        for sym, close, high, pct, vr in all_lifetime[:40]:
-            msg += f"• {sym} @ {close:.2f} | +{pct:.1f}% ATH | Vol {vr:.1f}x\n"
-        if len(all_lifetime) > 40: msg += f"+ {len(all_lifetime)-40} more...\n"
-        msg += "\n"
-    else:
-        msg += "*🏆 ALL LIFETIME HIGH:* None this week\n\n"
-    if all_52w:
-        msg += f"*📈 ALL 52W HIGH ({len(all_52w)}):*\n"
-        for sym, close, high, pct, vr in all_52w[:40]:
-            msg += f"• {sym} @ {close:.2f} | +{pct:.1f}% 52W | Vol {vr:.1f}x\n"
-        if len(all_52w) > 40: msg += f"+ {len(all_52w)-40} more...\n"
-        msg += "\n"
-    else:
-        msg += "*📈 ALL 52W HIGH:* None this week\n\n"
-    if near_high:
-        msg += f"*👀 NEAR HIGH - Watch Next Week ({len(near_high)}):*\n"
-        for sym, close, high, pct, vr in near_high[:20]:
-            msg += f"• {sym} @ {close:.2f} | {pct:.1f}% below 52W | Vol {vr:.1f}x\n"
-        if len(near_high) > 20: msg += f"+ {len(near_high)-20} more...\n"
-    return msg
+def generate_pdf(today, nse_data, bse_data, nse_total, bse_total):
+    pdf = FPDF(orientation='P', unit='mm', format='A4')
+    pdf.set_auto_page_break(auto=True, margin=15)
+    def clean(s):
+        return s.encode('latin-1', 'replace').decode('latin-1')
+    def add_title(title, subtitle):
+        pdf.add_page()
+        pdf.set_font("Helvetica", "B", 18)
+        pdf.cell(0, 12, clean(title), new_x="LMARGIN", new_y="NEXT", align="C")
+        pdf.set_font("Helvetica", "", 10)
+        pdf.cell(0, 7, clean(subtitle), new_x="LMARGIN", new_y="NEXT", align="C")
+        pdf.ln(3)
+    def add_table(heading, rows, pct_label):
+        if not rows:
+            pdf.set_font("Helvetica", "B", 12)
+            pdf.cell(0, 8, clean(heading), new_x="LMARGIN", new_y="NEXT")
+            pdf.set_font("Helvetica", "", 10)
+            pdf.cell(0, 7, "None this week", new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(2)
+            return
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(0, 8, clean(f"{heading} ({len(rows)})"), new_x="LMARGIN", new_y="NEXT")
+        pdf.set_fill_color(30, 30, 30)
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.cell(12, 7, "#", border=1, fill=True)
+        pdf.cell(55, 7, "Symbol", border=1, fill=True)
+        pdf.cell(35, 7, "Price", border=1, fill=True)
+        pdf.cell(40, 7, pct_label, border=1, fill=True)
+        pdf.cell(38, 7, "Vol", border=1, fill=True, new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_font("Helvetica", "", 9)
+        for i, (sym, close, high, pct, vr) in enumerate(rows, 1):
+            if i % 2 == 0:
+                pdf.set_fill_color(240, 240, 240)
+            else:
+                pdf.set_fill_color(255, 255, 255)
+            pdf.cell(12, 6, str(i), border=1, fill=True)
+            pdf.cell(55, 6, clean(str(sym)), border=1, fill=True)
+            pdf.cell(35, 6, f"{close:.2f}", border=1, fill=True)
+            pdf.cell(40, 6, f"+{pct:.1f}%", border=1, fill=True)
+            pdf.cell(38, 6, f"{vr:.1f}x", border=1, fill=True, new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(3)
+    def add_near_table(heading, rows):
+        if not rows:
+            return
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(0, 8, clean(f"{heading} ({len(rows)})"), new_x="LMARGIN", new_y="NEXT")
+        pdf.set_fill_color(30, 30, 30); pdf.set_text_color(255, 255, 255); pdf.set_font("Helvetica", "B", 9)
+        pdf.cell(12, 7, "#", border=1, fill=True); pdf.cell(55, 7, "Symbol", border=1, fill=True); pdf.cell(35, 7, "Price", border=1, fill=True); pdf.cell(40, 7, "Below 52W", border=1, fill=True); pdf.cell(38, 7, "Vol", border=1, fill=True, new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(0, 0, 0); pdf.set_font("Helvetica", "", 9)
+        for i, (sym, close, high, pct, vr) in enumerate(rows, 1):
+            if i % 2 == 0:
+                pdf.set_fill_color(240, 240, 240)
+            else:
+                pdf.set_fill_color(255, 255, 255)
+            pdf.cell(12, 6, str(i), border=1, fill=True); pdf.cell(55, 6, clean(str(sym)), border=1, fill=True); pdf.cell(35, 6, f"{close:.2f}", border=1, fill=True); pdf.cell(40, 6, f"{pct:.1f}%", border=1, fill=True); pdf.cell(38, 6, f"{vr:.1f}x", border=1, fill=True, new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(3)
+    pdf.add_page()
+    pdf.ln(40)
+    pdf.set_font("Helvetica", "B", 26)
+    pdf.cell(0, 15, "WEEKLY BREAKOUT", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.set_font("Helvetica", "", 14)
+    pdf.cell(0, 10, clean(f"NSE + BSE | {today}"), new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.ln(5)
+    pdf.set_font("Helvetica", "", 11)
+    pdf.cell(0, 7, clean(f"NSE Universe: {nse_total} | BSE Universe: {bse_total}"), new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.cell(0, 7, "Filter: Weekly Vol > 2x SMA 21 | No 260 Days Filter", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.cell(0, 7, "Even stocks listed 1 month ago included", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.ln(10)
+    vlt_n, v52_n, alt_n, a52_n, near_n = nse_data
+    vlt_b, v52_b, alt_b, a52_b, near_b = bse_data
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(0, 8, "SUMMARY", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.set_font("Helvetica", "", 11)
+    pdf.cell(0, 7, clean(f"NSE - Vol Lifetime: {len(vlt_n)} | Vol 52W: {len(v52_n)} | ALL Lifetime: {len(alt_n)} | ALL 52W: {len(a52_n)} | Near: {len(near_n)}"), new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.cell(0, 7, clean(f"BSE - Vol Lifetime: {len(vlt_b)} | Vol 52W: {len(v52_b)} | ALL Lifetime: {len(alt_b)} | ALL 52W: {len(a52_b)} | Near: {len(near_b)}"), new_x="LMARGIN", new_y="NEXT", align="C")
+    add_title("NSE - LIST 1: Vol 2x", f"Weekly Vol > 2x SMA 21 | {today}")
+    add_table("LIFETIME HIGH + Vol 2x", vlt_n, "Above ATH")
+    add_table("52W HIGH + Vol 2x", v52_n, "Above 52W")
+    add_title("NSE - LIST 2: ALL Breakouts", f"No Volume Filter | {today}")
+    add_table("ALL LIFETIME HIGH", alt_n, "Above ATH")
+    add_table("ALL 52W HIGH", a52_n, "Above 52W")
+    add_near_table("NEAR HIGH - Watch Next Week", near_n)
+    add_title("BSE - LIST 1: Vol 2x", f"Weekly Vol > 2x SMA 21 | {today}")
+    add_table("LIFETIME HIGH + Vol 2x", vlt_b, "Above ATH")
+    add_table("52W HIGH + Vol 2x", v52_b, "Above 52W")
+    add_title("BSE - LIST 2: ALL Breakouts", f"No Volume Filter | {today}")
+    add_table("ALL LIFETIME HIGH", alt_b, "Above ATH")
+    add_table("ALL 52W HIGH", a52_b, "Above 52W")
+    add_near_table("NEAR HIGH - Watch Next Week", near_b)
+    pdf_path = f"Weekly_Breakout_{today}.pdf"
+    pdf.output(pdf_path)
+    print(f"PDF generated: {pdf_path}")
+    return pdf_path
 
 def main():
     today = datetime.now().strftime('%Y-%m-%d')
-    print(f"=== Weekly Breakout NSE+BSE - 4 Messages - {today} ===")
+    print(f"=== Weekly Breakout NSE+BSE - PDF ONLY - {today} ===")
     nse_syms = fetch_nse()
     nse_syms = list(dict.fromkeys(nse_syms))
     vol_lt_nse, vol_52_nse, all_lt_nse, all_52_nse, near_nse = process_exchange(nse_syms, ".NS", "NSE")
-    msg1_nse = build_msg_list1("NSE", len(nse_syms), vol_lt_nse, vol_52_nse, today)
-    msg2_nse = build_msg_list2("NSE", len(nse_syms), all_lt_nse, all_52_nse, near_nse, today)
-    print("=== NSE MSG1 ==="); print(msg1_nse)
-    print("=== NSE MSG2 ==="); print(msg2_nse)
-    send_telegram(msg1_nse)
-    send_telegram(msg2_nse)
-    bse_syms = fetch_bse()
+    nse_data = (vol_lt_nse, vol_52_nse, all_lt_nse, all_52_nse, near_nse)
+    bse_syms = fetch_bse_bhavcopy()
     bse_syms = list(dict.fromkeys(bse_syms))
     if len(bse_syms) > 500:
         vol_lt_bse, vol_52_bse, all_lt_bse, all_52_bse, near_bse = process_exchange(bse_syms, ".BO", "BSE")
-        msg1_bse = build_msg_list1("BSE", len(bse_syms), vol_lt_bse, vol_52_bse, today)
-        msg2_bse = build_msg_list2("BSE", len(bse_syms), all_lt_bse, all_52_bse, near_bse, today)
-        print("=== BSE MSG1 ==="); print(msg1_bse)
-        print("=== BSE MSG2 ==="); print(msg2_bse)
-        send_telegram(msg1_bse)
-        send_telegram(msg2_bse)
+        bse_data = (vol_lt_bse, vol_52_bse, all_lt_bse, all_52_bse, near_bse)
     else:
-        print("BSE skipped - API blocked, NSE messages already sent")
+        print("BSE skipped - Bhavcopy + API both failed, NSE PDF will still send")
+        bse_data = ([], [], [], [], [])
+    try:
+        pdf_path = generate_pdf(today, nse_data, bse_data, len(nse_syms), len(bse_syms))
+        send_telegram_pdf(pdf_path, f"📄 WEEKLY BREAKOUT - NSE + BSE | {today}\nFull List Inside PDF")
+    except Exception as e:
+        print(f"PDF failed: {e}")
 
 if __name__ == "__main__":
     main()
