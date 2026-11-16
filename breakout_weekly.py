@@ -1,5 +1,4 @@
-# Weekly Breakout - ALL NSE + ALL BSE - PDF ONLY with TradingView Links - TRUE ATH FIX v2
-# FIX: auto_adjust=False (real price like TradingView) + period=max (full history)
+# Weekly Breakout - ALL NSE + ALL BSE - PDF ONLY with TradingView + Screener Links - TRUE ATH FIX
 import yfinance as yf, pandas as pd, numpy as np, urllib.request, io, os, requests, json, time, zipfile
 from datetime import datetime, timedelta
 from fpdf import FPDF
@@ -91,8 +90,7 @@ def process_exchange(symbols, suffix, exchange_name):
         chunk_tickers = tickers[ci:ci+CHUNK]
         print(f"{exchange_name} Chunk {ci//CHUNK+1}/{(len(tickers)+CHUNK-1)//CHUNK} - {len(chunk_tickers)}")
         try:
-            # FIXED: period=max + auto_adjust=False = Real TradingView Price
-            data = yf.download(chunk_tickers, period="max", interval="1d", progress=False, auto_adjust=False, threads=False, group_by='ticker')
+            data = yf.download(chunk_tickers, period="max", interval="1d", progress=False, auto_adjust=True, threads=False, group_by='ticker')
         except Exception as e:
             print(f"Chunk failed: {e}"); time.sleep(5); continue
         time.sleep(2)
@@ -103,7 +101,6 @@ def process_exchange(symbols, suffix, exchange_name):
                 if dfd is None or len(dfd) < 5: continue
                 dfd = dfd.dropna()
                 if len(dfd) < 5: continue
-                # Use Close column (unadjusted Close, not Adj Close)
                 dfw = pd.DataFrame()
                 dfw['Close'] = dfd['Close'].resample('W-FRI').last()
                 dfw['High'] = dfd['High'].resample('W-FRI').max()
@@ -126,7 +123,6 @@ def process_exchange(symbols, suffix, exchange_name):
                     prev_52w_high = float(dfw_closed['High'].iloc[-53:-1].max())
                 else:
                     prev_52w_high = float(dfw_closed['High'].iloc[:-1].max()) if len(dfw_closed) > 1 else float(dfw_closed['High'].iloc[-1])
-                # TRUE Lifetime High = Max High of ALL history BEFORE last week, unadjusted
                 lifetime_high = float(dfw_closed['High'].iloc[:-1].max()) if len(dfw_closed) > 1 else float(dfw_closed['High'].iloc[-1])
                 pct_above_52w = (last_close / prev_52w_high - 1) * 100 if prev_52w_high else 0
                 pct_above_lifetime = (last_close / lifetime_high - 1) * 100 if lifetime_high else 0
@@ -163,6 +159,13 @@ def generate_pdf(today, nse_data, bse_data, nse_total, bse_total):
         return s.encode('latin-1', 'replace').decode('latin-1')
     def tv_link(exchange, sym):
         return f"https://www.tradingview.com/chart/?symbol={exchange}:{sym}"
+    def screener_link(exchange, sym):
+        # NSE: direct company page - works for most NSE symbols
+        # BSE: search page - click company once (Screener uses NSE symbol as slug, not BSE code)
+        if exchange == "NSE":
+            return f"https://www.screener.in/company/{sym}/consolidated/"
+        else:
+            return f"https://www.screener.in/search/?q={sym}"
     def add_title(title, subtitle):
         pdf.add_page()
         pdf.set_font("Helvetica", "B", 18)
@@ -171,7 +174,7 @@ def generate_pdf(today, nse_data, bse_data, nse_total, bse_total):
         pdf.cell(0, 7, clean(subtitle), new_x="LMARGIN", new_y="NEXT", align="C")
         pdf.set_font("Helvetica", "I", 9)
         pdf.set_text_color(0, 0, 255)
-        pdf.cell(0, 6, "Click on Symbol (blue) to open TradingView Chart", new_x="LMARGIN", new_y="NEXT", align="C")
+        pdf.cell(0, 6, "Symbol = TradingView Chart | Screener = Screener.in Financials", new_x="LMARGIN", new_y="NEXT", align="C")
         pdf.set_text_color(0, 0, 0)
         pdf.ln(3)
     def add_table(heading, rows, pct_label, exchange):
@@ -186,52 +189,60 @@ def generate_pdf(today, nse_data, bse_data, nse_total, bse_total):
         pdf.cell(0, 8, clean(f"{heading} ({len(rows)})"), new_x="LMARGIN", new_y="NEXT")
         pdf.set_fill_color(30, 30, 30)
         pdf.set_text_color(255, 255, 255)
-        pdf.set_font("Helvetica", "B", 8)
+        pdf.set_font("Helvetica", "B", 9)
+        # Widths total 180: 10 + 45 + 28 + 32 + 25 + 40 = 180
         pdf.cell(10, 7, "#", border=1, fill=True)
-        pdf.cell(42, 7, "Symbol", border=1, fill=True)
+        pdf.cell(45, 7, "Symbol - Chart", border=1, fill=True)
         pdf.cell(28, 7, "Price", border=1, fill=True)
-        pdf.cell(32, 7, "Prev High", border=1, fill=True)
         pdf.cell(32, 7, pct_label, border=1, fill=True)
-        pdf.cell(36, 7, "Vol", border=1, fill=True, new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(25, 7, "Vol", border=1, fill=True)
+        pdf.cell(40, 7, "Screener - Financials", border=1, fill=True, new_x="LMARGIN", new_y="NEXT")
         pdf.set_text_color(0, 0, 0)
         for i, (sym, close, high, pct, vr) in enumerate(rows, 1):
             if i % 2 == 0:
                 pdf.set_fill_color(240, 240, 240)
             else:
                 pdf.set_fill_color(255, 255, 255)
-            pdf.set_font("Helvetica", "", 8)
+            pdf.set_font("Helvetica", "", 9)
             pdf.cell(10, 6, str(i), border=1, fill=True)
             pdf.set_text_color(0, 0, 255)
-            pdf.set_font("Helvetica", "U", 8)
-            pdf.cell(42, 6, clean(str(sym)), border=1, fill=True, link=tv_link(exchange, str(sym)))
+            pdf.set_font("Helvetica", "U", 9)
+            pdf.cell(45, 6, clean(str(sym)), border=1, fill=True, link=tv_link(exchange, str(sym)))
             pdf.set_text_color(0, 0, 0)
-            pdf.set_font("Helvetica", "", 8)
+            pdf.set_font("Helvetica", "", 9)
             pdf.cell(28, 6, f"{close:.2f}", border=1, fill=True)
-            pdf.cell(32, 6, f"{high:.2f}", border=1, fill=True)
             pdf.cell(32, 6, f"+{pct:.1f}%", border=1, fill=True)
-            pdf.cell(36, 6, f"{vr:.1f}x", border=1, fill=True, new_x="LMARGIN", new_y="NEXT")
+            pdf.cell(25, 6, f"{vr:.1f}x", border=1, fill=True)
+            pdf.set_text_color(0, 0, 255)
+            pdf.set_font("Helvetica", "U", 9)
+            pdf.cell(40, 6, "Screener >", border=1, fill=True, link=screener_link(exchange, str(sym)), new_x="LMARGIN", new_y="NEXT")
+            pdf.set_text_color(0, 0, 0)
         pdf.ln(3)
     def add_near_table(heading, rows, exchange):
         if not rows:
             return
         pdf.set_font("Helvetica", "B", 12)
         pdf.cell(0, 8, clean(f"{heading} ({len(rows)})"), new_x="LMARGIN", new_y="NEXT")
-        pdf.set_fill_color(30, 30, 30); pdf.set_text_color(255, 255, 255); pdf.set_font("Helvetica", "B", 8)
-        pdf.cell(10, 7, "#", border=1, fill=True); pdf.cell(42, 7, "Symbol", border=1, fill=True); pdf.cell(28, 7, "Price", border=1, fill=True); pdf.cell(32, 7, "Prev 52W High", border=1, fill=True); pdf.cell(32, 7, "Below 52W", border=1, fill=True); pdf.cell(36, 7, "Vol", border=1, fill=True, new_x="LMARGIN", new_y="NEXT")
+        pdf.set_fill_color(30, 30, 30); pdf.set_text_color(255, 255, 255); pdf.set_font("Helvetica", "B", 9)
+        pdf.cell(10, 7, "#", border=1, fill=True); pdf.cell(45, 7, "Symbol - Chart", border=1, fill=True); pdf.cell(28, 7, "Price", border=1, fill=True); pdf.cell(32, 7, "Below 52W", border=1, fill=True); pdf.cell(25, 7, "Vol", border=1, fill=True); pdf.cell(40, 7, "Screener - Financials", border=1, fill=True, new_x="LMARGIN", new_y="NEXT")
         pdf.set_text_color(0, 0, 0)
         for i, (sym, close, high, pct, vr) in enumerate(rows, 1):
             if i % 2 == 0:
                 pdf.set_fill_color(240, 240, 240)
             else:
                 pdf.set_fill_color(255, 255, 255)
-            pdf.set_font("Helvetica", "", 8)
+            pdf.set_font("Helvetica", "", 9)
             pdf.cell(10, 6, str(i), border=1, fill=True)
             pdf.set_text_color(0, 0, 255)
-            pdf.set_font("Helvetica", "U", 8)
-            pdf.cell(42, 6, clean(str(sym)), border=1, fill=True, link=tv_link(exchange, str(sym)))
+            pdf.set_font("Helvetica", "U", 9)
+            pdf.cell(45, 6, clean(str(sym)), border=1, fill=True, link=tv_link(exchange, str(sym)))
             pdf.set_text_color(0, 0, 0)
-            pdf.set_font("Helvetica", "", 8)
-            pdf.cell(28, 6, f"{close:.2f}", border=1, fill=True); pdf.cell(32, 6, f"{high:.2f}", border=1, fill=True); pdf.cell(32, 6, f"{pct:.1f}%", border=1, fill=True); pdf.cell(36, 6, f"{vr:.1f}x", border=1, fill=True, new_x="LMARGIN", new_y="NEXT")
+            pdf.set_font("Helvetica", "", 9)
+            pdf.cell(28, 6, f"{close:.2f}", border=1, fill=True); pdf.cell(32, 6, f"{pct:.1f}%", border=1, fill=True); pdf.cell(25, 6, f"{vr:.1f}x", border=1, fill=True)
+            pdf.set_text_color(0, 0, 255)
+            pdf.set_font("Helvetica", "U", 9)
+            pdf.cell(40, 6, "Screener >", border=1, fill=True, link=screener_link(exchange, str(sym)), new_x="LMARGIN", new_y="NEXT")
+            pdf.set_text_color(0, 0, 0)
         pdf.ln(3)
     pdf.add_page()
     pdf.ln(40)
@@ -243,10 +254,10 @@ def generate_pdf(today, nse_data, bse_data, nse_total, bse_total):
     pdf.set_font("Helvetica", "", 11)
     pdf.cell(0, 7, clean(f"NSE Universe: {nse_total} | BSE Universe: {bse_total}"), new_x="LMARGIN", new_y="NEXT", align="C")
     pdf.cell(0, 7, "Filter: Weekly Vol > 2x SMA 21 | No 260 Days Filter", new_x="LMARGIN", new_y="NEXT", align="C")
-    pdf.cell(0, 7, "Price = Unadjusted (Like TradingView) | ATH = True ATH Since IPO", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.cell(0, 7, "Lifetime High = True ATH since IPO (Full History)", new_x="LMARGIN", new_y="NEXT", align="C")
     pdf.set_font("Helvetica", "I", 10)
     pdf.set_text_color(0, 0, 255)
-    pdf.cell(0, 7, "Click any Symbol in PDF to open TradingView Chart", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.cell(0, 7, "Symbol = TradingView Chart | Screener = Screener.in Financials", new_x="LMARGIN", new_y="NEXT", align="C")
     pdf.set_text_color(0, 0, 0)
     pdf.ln(10)
     vlt_n, v52_n, alt_n, a52_n, near_n = nse_data
@@ -277,7 +288,7 @@ def generate_pdf(today, nse_data, bse_data, nse_total, bse_total):
 
 def main():
     today = datetime.now().strftime('%Y-%m-%d')
-    print(f"=== Weekly Breakout NSE+BSE - PDF ONLY TRUE ATH v2 - {today} ===")
+    print(f"=== Weekly Breakout NSE+BSE - PDF ONLY TRUE ATH - {today} ===")
     nse_syms = fetch_nse()
     nse_syms = list(dict.fromkeys(nse_syms))
     vol_lt_nse, vol_52_nse, all_lt_nse, all_52_nse, near_nse = process_exchange(nse_syms, ".NS", "NSE")
@@ -292,7 +303,7 @@ def main():
         bse_data = ([], [], [], [], [])
     try:
         pdf_path = generate_pdf(today, nse_data, bse_data, len(nse_syms), len(bse_syms))
-        send_telegram_pdf(pdf_path, f"📄 WEEKLY BREAKOUT - NSE + BSE | {today}\nTRUE ATH Fixed (Unadjusted Price) - Click Symbol for TradingView")
+        send_telegram_pdf(pdf_path, f"📄 WEEKLY BREAKOUT - NSE + BSE | {today}\nTRUE ATH Fixed - Click Symbol for TradingView, Screener for Financials")
     except Exception as e:
         print(f"PDF failed: {e}")
 
